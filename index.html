@@ -205,6 +205,10 @@
     box-shadow:0 4px 16px rgba(108,92,231,0.3);
   }
   .send-btn.inactive { background:rgba(50,50,70,0.5); color:#555; cursor:not-allowed; }
+  .send-btn.stop {
+    background:linear-gradient(135deg,#e74c3c,#ff6b6b); color:#fff;
+    box-shadow:0 4px 16px rgba(231,76,60,0.3); cursor:pointer;
+  }
   .footer-text { text-align:center; margin-top:7px; font-size:11px; color:#44445a; }
 
   /* Mobile */
@@ -250,6 +254,10 @@ var MODELS = [
 ];
 
 var PCOLORS = { OpenAI:"#10a37f", Anthropic:"#d4a27f", Google:"#4285f4", Meta:"#0668E1", DeepSeek:"#536af0", Mistral:"#f77b2e", Qwen:"#6c5ce7" };
+
+var STORAGE_KEY = "or-chat-history";
+function saveChats(chats) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(chats)); } catch(e){} }
+function loadChats() { try { var d = localStorage.getItem(STORAGE_KEY); return d ? JSON.parse(d) : []; } catch(e){ return []; } }
 
 function gid() { return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
 
@@ -363,12 +371,13 @@ function Message(props) {
 
 function App() {
   var s1=useState(null); var apiKey=s1[0]; var setApiKey=s1[1];
-  var s2=useState([]); var chats=s2[0]; var setChats=s2[1];
-  var s3=useState(null); var activeChatId=s3[0]; var setActiveChatId=s3[1];
+  var saved=loadChats();
+  var s2=useState(saved); var chats=s2[0]; var setChats=s2[1];
+  var s3=useState(saved.length>0?saved[0].id:null); var activeChatId=s3[0]; var setActiveChatId=s3[1];
   var s4=useState(""); var input=s4[0]; var setInput=s4[1];
   var s5=useState(false); var streaming=s5[0]; var setStreaming=s5[1];
   var s6=useState(window.innerWidth>700); var sidebarOpen=s6[0]; var setSidebarOpen=s6[1];
-  var endRef=useRef(null); var inputRef=useRef(null);
+  var endRef=useRef(null); var inputRef=useRef(null); var abortRef=useRef(null);
   var isMobile = window.innerWidth <= 700;
 
   var activeChat = chats.find(function(c){return c.id===activeChatId;});
@@ -384,8 +393,13 @@ function App() {
     setChats(function(p){return p.map(function(c){return c.id===cid?fn(c):c;});});
   },[]);
 
+  useEffect(function(){ saveChats(chats); },[chats]);
   useEffect(function(){if(endRef.current) endRef.current.scrollIntoView({behavior:"smooth"});},[activeChat?.messages?.length]);
   useEffect(function(){if(!streaming && inputRef.current) inputRef.current.focus();},[streaming,activeChatId]);
+
+  function stopGeneration() {
+    if(abortRef.current) { abortRef.current.abort(); abortRef.current=null; }
+  }
 
   async function sendMessage() {
     if(!input.trim()||streaming||!activeChat) return;
@@ -405,11 +419,13 @@ function App() {
     });});
 
     try {
+      abortRef.current=new AbortController();
       var allMsgs=activeChat.messages.concat([userMsg]).map(function(m){return{role:m.role,content:m.content};});
       var res=await fetch("https://openrouter.ai/api/v1/chat/completions",{
         method:"POST",
         headers:{"Authorization":"Bearer "+apiKey,"Content-Type":"application/json","HTTP-Referer":window.location.origin},
-        body:JSON.stringify({model:activeChat.model,messages:allMsgs,stream:true})
+        body:JSON.stringify({model:activeChat.model,messages:allMsgs,stream:true}),
+        signal:abortRef.current.signal
       });
       if(!res.ok){var ed=await res.json().catch(function(){return{};}); throw new Error(ed.error?.message||"API error "+res.status);}
 
@@ -434,13 +450,15 @@ function App() {
         }
       }
     } catch(err) {
-      updateChat(chatId,function(c){return Object.assign({},c,{
-        messages:c.messages.map(function(m){return m.id===aid?Object.assign({},m,{content:"\u26A0\uFE0F Error: "+err.message}):m;})
-      });});
-    } finally { setStreaming(false); }
+      if(err.name!=="AbortError") {
+        updateChat(chatId,function(c){return Object.assign({},c,{
+          messages:c.messages.map(function(m){return m.id===aid?Object.assign({},m,{content:"\u26A0\uFE0F Error: "+err.message}):m;})
+        });});
+      }
+    } finally { abortRef.current=null; setStreaming(false); }
   }
 
-  if(!apiKey) return e(ApiKeyScreen,{onSubmit:function(k){setApiKey(k);createChat();}});
+  if(!apiKey) return e(ApiKeyScreen,{onSubmit:function(k){setApiKey(k);if(chats.length===0)createChat();}});
 
   return e("div",{className:"app-layout"},
     isMobile && sidebarOpen ? e("div",{className:"sidebar-overlay",onClick:function(){setSidebarOpen(false);}}) : null,
@@ -457,7 +475,7 @@ function App() {
       e("div",{className:"header"},
         e("button",{className:"toggle-btn",onClick:function(){setSidebarOpen(function(p){return!p;});}},sidebarOpen?"\u25C1":"\u2630"),
         activeChat ? e(ModelSelector,{model:activeChat.model,onChange:function(m){updateChat(activeChatId,function(c){return Object.assign({},c,{model:m});});}}) : null,
-        e("button",{className:"signout-btn",onClick:function(){setApiKey(null);setChats([]);}},"Sign Out")
+        e("button",{className:"signout-btn",onClick:function(){setApiKey(null);setChats([]);localStorage.removeItem(STORAGE_KEY);}},"Sign Out")
       ),
       e("div",{className:"messages-area"},
         activeChat && activeChat.messages.length===0 ?
@@ -479,8 +497,10 @@ function App() {
             onKeyDown:function(ev){if(ev.key==="Enter"&&!ev.shiftKey){ev.preventDefault();sendMessage();}},
             onInput:function(ev){ev.target.style.height="auto";ev.target.style.height=Math.min(ev.target.scrollHeight,120)+"px";}
           }),
-          e("button",{className:"send-btn "+(input.trim()&&!streaming?"active":"inactive"),
-            disabled:!input.trim()||streaming, onClick:sendMessage},"\u2191")
+          streaming ?
+            e("button",{className:"send-btn stop", onClick:stopGeneration},"\u25A0") :
+            e("button",{className:"send-btn "+(input.trim()?"active":"inactive"),
+              disabled:!input.trim(), onClick:sendMessage},"\u2191")
         ),
         e("div",{className:"footer-text"},"Powered by OpenRouter \u00B7 Responses may be inaccurate")
       )
